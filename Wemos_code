@@ -1,0 +1,446 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <AccelStepper.h>
+
+// ========== TUNABLE PARAMETERS ==========
+// WiFi credentials
+const char* ssid = "YourWiFiSSID";
+const char* password = "YourWiFiPassword";
+
+// Motor and mechanical setup - NEMA 17 1.8° 1.7A/phase
+const int STEPS_PER_REV = 200;        // Steps per revolution (1.8° stepper = 200 steps)
+const int MICROSTEPS = 16;            // Microstepping (1/16)
+const int PULLEY_TEETH = 16;          // GT2 pulley teeth
+const float BELT_PITCH = 2.0;         // GT2 belt pitch in mm
+const float SLIDER_LENGTH = 1000.0;   // Usable slider length in mm
+
+// Speed settings (percentage based)
+const float MAX_SPEED_MM_S = 200.0;   // Maximum physical speed in mm/s
+const float MIN_SPEED_MM_S = 5.0;     // Minimum physical speed in mm/s
+const float ACCELERATION = 200.0;     // Acceleration in steps/second²
+
+// Pin definitions for Wemos D1 Mini
+const int STEP_PIN = D6;              // Step pin
+const int DIR_PIN = D7;               // Direction pin
+const int ENABLE_PIN = D5;            // Enable pin (optional)
+
+// Direction settings - easily adjustable
+const bool LEFT_IS_POSITIVE = true;   // true = left is positive direction, false = right is positive
+const bool INVERT_MOTOR_DIR = false;  // Set to true to invert motor direction if needed
+
+// ========== CALCULATED VALUES ==========
+const float MM_PER_REV = PULLEY_TEETH * BELT_PITCH;  // mm per motor revolution
+const float STEPS_PER_MM = (STEPS_PER_REV * MICROSTEPS) / MM_PER_REV;
+const long MAX_POSITION = SLIDER_LENGTH * STEPS_PER_MM;
+
+// ========== GLOBAL VARIABLES ==========
+AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+ESP8266WebServer server(80);
+
+// Movement parameters
+float startPosition = 0.0;      // Start position in mm
+float endPosition = 500.0;      // End position in mm
+float moveSpeed = 50.0;         // Speed in mm/s
+bool moveDirection = true;      // true = start to end, false = end to start
+bool isHomed = false;           // Homing status
+bool isMoving = false;          // Movement status
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Camera Slider Starting...");
+  
+  // Initialize pins
+  pinMode(ENABLE_PIN, OUTPUT);
+  digitalWrite(ENABLE_PIN, HIGH); // Disable motor initially
+  
+  // Configure stepper
+  stepper.setMaxSpeed(MAX_SPEED_STEPS);
+  stepper.setAcceleration(ACCELERATION);
+  
+  if (INVERT_MOTOR_DIR) {
+    stepper.setPinsInverted(true, false, false);
+  }
+  
+  // Initialize WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("WiFi connected! IP address: ");
+  Serial.println(WiFi.localIP());
+  
+  // Setup web server routes
+  server.on("/", handleRoot);
+  server.on("/home", handleHome);
+  server.on("/move", handleMove);
+  server.on("/stop", handleStop);
+  server.on("/status", handleStatus);
+  server.begin();
+  
+  Serial.println("Web server started");
+  Serial.println("Ready! Please home the slider manually before use.");
+}
+
+// ========== MAIN LOOP ==========
+void loop() {
+  // Handle web server requests (non-blocking)
+  server.handleClient();
+  
+  // Handle stepper movement (non-blocking)
+  // stepper.run() returns true if motor is still moving
+  if (isMoving) {
+    bool stillMoving = stepper.run();
+    
+    // Check if movement completed
+    if (!stillMoving || stepper.distanceToGo() == 0) {
+      isMoving = false;
+      digitalWrite(ENABLE_PIN, HIGH); // Disable motor when stopped
+      Serial.println("Movement completed");
+      Serial.printf("Final position: %.1fmm\n", stepper.currentPosition() / STEPS_PER_MM);
+    }
+  }
+  
+  // Small yield to prevent watchdog issues
+  yield();
+}
+
+// ========== WEB INTERFACE ==========
+void handleRoot() {
+  String html = R"(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Camera Slider Control</title>
+  <style>
+    body { 
+      font-family: Arial, sans-serif; 
+      margin: 0; 
+      padding: 20px; 
+      background: #f0f0f0;
+      font-size: 16px;
+    }
+    .container { 
+      max-width: 400px; 
+      margin: 0 auto; 
+      background: white; 
+      padding: 20px; 
+      border-radius: 10px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    }
+    .header { 
+      text-align: center; 
+      color: #333; 
+      margin-bottom: 30px;
+    }
+    .section { 
+      margin-bottom: 25px; 
+      padding: 15px; 
+      background: #f8f8f8; 
+      border-radius: 5px;
+    }
+    .section h3 { 
+      margin-top: 0; 
+      color: #444;
+    }
+    .input-group { 
+      margin-bottom: 15px; 
+    }
+    label { 
+      display: block; 
+      margin-bottom: 5px; 
+      font-weight: bold;
+      color: #555;
+    }
+    input, select { 
+      width: 100%; 
+      padding: 12px; 
+      border: 1px solid #ddd; 
+      border-radius: 5px;
+      font-size: 16px;
+      box-sizing: border-box;
+    }
+    button { 
+      width: 100%; 
+      padding: 15px; 
+      font-size: 18px; 
+      border: none; 
+      border-radius: 5px; 
+      cursor: pointer;
+      margin-bottom: 10px;
+    }
+    .btn-primary { 
+      background: #007bff; 
+      color: white; 
+    }
+    .btn-danger { 
+      background: #dc3545; 
+      color: white; 
+    }
+    .btn-warning { 
+      background: #ffc107; 
+      color: black; 
+    }
+    .status { 
+      padding: 10px; 
+      margin-bottom: 20px; 
+      border-radius: 5px; 
+      text-align: center;
+      font-weight: bold;
+    }
+    .status.warning { 
+      background: #fff3cd; 
+      color: #856404; 
+      border: 1px solid #ffeaa7;
+    }
+    .status.success { 
+      background: #d4edda; 
+      color: #155724; 
+      border: 1px solid #c3e6cb;
+    }
+    .calculation { 
+      background: #e7f3ff; 
+      padding: 10px; 
+      border-radius: 5px; 
+      margin-top: 10px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>📹 Camera Slider</h1>
+    </div>
+    
+    <div id="status" class="status warning">
+      Please home the slider manually first!
+    </div>
+    
+    <div class="section">
+      <h3>Manual Homing</h3>
+      <p>Move the slider to the starting position (0mm) manually, then click:</p>
+      <button class="btn-warning" onclick="homeSlider()">Set Current Position as Home (0mm)</button>
+    </div>
+    
+    <div class="section">
+      <h3>Movement Setup</h3>
+      
+      <div class="input-group">
+        <label>Start Position (mm):</label>
+        <input type="number" id="startPos" value="0" min="0" max="1000" onchange="updateCalculation()">
+      </div>
+      
+      <div class="input-group">
+        <label>End Position (mm):</label>
+        <input type="number" id="endPos" value="500" min="0" max="1000" onchange="updateCalculation()">
+      </div>
+      
+      <div class="input-group">
+        <label>Speed (%):</label>
+        <input type="number" id="speed" value="50" min="1" max="100" onchange="updateCalculation()">
+        <small style="color: #666; font-size: 12px;">1% = slow, 100% = fast</small>
+      </div>
+      
+      <div class="input-group">
+        <label>Direction:</label>
+        <select id="direction" onchange="updateCalculation()">
+          <option value="true">Left → Right</option>
+          <option value="false">Right → Left</option>
+        </select>
+      </div>
+      
+      <div id="calculation" class="calculation">
+        Distance: 500mm | Speed: 102.5mm/s | Time: 4.9s
+      </div>
+    </div>
+    
+    <div class="section">
+      <h3>Controls</h3>
+      <button class="btn-primary" onclick="startMove()" id="startBtn">▶️ Start Movement</button>
+      <button class="btn-danger" onclick="stopMove()">⏹️ Emergency Stop</button>
+    </div>
+  </div>
+
+  <script>
+    let isHomed = false;
+    let isMoving = false;
+    
+    function updateStatus() {
+      fetch('/status')
+        .then(response => response.json())
+        .then(data => {
+          isHomed = data.homed;
+          isMoving = data.moving;
+          
+          const statusDiv = document.getElementById('status');
+          const startBtn = document.getElementById('startBtn');
+          
+          if (!isHomed) {
+            statusDiv.className = 'status warning';
+            statusDiv.textContent = 'Please home the slider manually first!';
+            startBtn.disabled = true;
+          } else if (isMoving) {
+            statusDiv.className = 'status warning';
+            statusDiv.textContent = 'Moving... Current position: ' + data.position.toFixed(1) + 'mm';
+            startBtn.disabled = true;
+          } else {
+            statusDiv.className = 'status success';
+            statusDiv.textContent = 'Ready! Current position: ' + data.position.toFixed(1) + 'mm';
+            startBtn.disabled = false;
+          }
+        });
+    }
+    
+    function updateCalculation() {
+      const start = parseFloat(document.getElementById('startPos').value);
+      const end = parseFloat(document.getElementById('endPos').value);
+      const speedPercent = parseFloat(document.getElementById('speed').value);
+      
+      // Calculate actual speed from percentage (5-200 mm/s range)
+      const actualSpeed = 5 + ((200 - 5) * speedPercent / 100);
+      const distance = Math.abs(end - start);
+      const time = distance / actualSpeed;
+      
+      document.getElementById('calculation').textContent = 
+        `Distance: ${distance}mm | Speed: ${actualSpeed.toFixed(1)}mm/s | Time: ${time.toFixed(1)}s`;
+    }
+    
+    function homeSlider() {
+      fetch('/home', {method: 'POST'})
+        .then(response => response.text())
+        .then(data => {
+          alert(data);
+          updateStatus();
+        });
+    }
+    
+    function startMove() {
+      const params = new URLSearchParams({
+        start: document.getElementById('startPos').value,
+        end: document.getElementById('endPos').value,
+        speed: document.getElementById('speed').value,
+        direction: document.getElementById('direction').value
+      });
+      
+      fetch('/move?' + params, {method: 'POST'})
+        .then(response => response.text())
+        .then(data => {
+          alert(data);
+          updateStatus();
+        });
+    }
+    
+    function stopMove() {
+      fetch('/stop', {method: 'POST'})
+        .then(response => response.text())
+        .then(data => {
+          alert(data);
+          updateStatus();
+        });
+    }
+    
+    // Update status every second
+    setInterval(updateStatus, 1000);
+    updateStatus();
+    updateCalculation();
+  </script>
+</body>
+</html>
+  )";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleHome() {
+  stepper.setCurrentPosition(0);
+  isHomed = true;
+  Serial.println("Slider homed to current position");
+  server.send(200, "text/plain", "Slider homed successfully!");
+}
+
+void handleMove() {
+  if (!isHomed) {
+    server.send(400, "text/plain", "Please home the slider first!");
+    return;
+  }
+  
+  if (isMoving) {
+    server.send(400, "text/plain", "Slider is already moving!");
+    return;
+  }
+  
+  // Get parameters
+  startPosition = server.arg("start").toFloat();
+  endPosition = server.arg("end").toFloat();
+  speedPercent = server.arg("speed").toInt();
+  moveDirection = server.arg("direction") == "true";
+  
+  // Validate positions
+  if (startPosition < 0 || startPosition > SLIDER_LENGTH ||
+      endPosition < 0 || endPosition > SLIDER_LENGTH) {
+    server.send(400, "text/plain", "Position out of range (0-1000mm)!");
+    return;
+  }
+  
+  // Validate speed
+  if (speedPercent < 1 || speedPercent > 100) {
+    server.send(400, "text/plain", "Speed must be between 1-100%!");
+    return;
+  }
+  
+  // Apply direction logic and calculate target steps
+  float targetPos = moveDirection ? endPosition : startPosition;
+  long targetSteps = targetPos * STEPS_PER_MM;
+  
+  // Apply LEFT_IS_POSITIVE direction setting
+  if (!LEFT_IS_POSITIVE) {
+    targetSteps = MAX_POSITION - targetSteps;
+  }
+  
+  // Convert percentage to actual speed
+  float actualSpeed = percentToSpeed(speedPercent);
+  float speedInSteps = actualSpeed * STEPS_PER_MM;
+  
+  // Configure movement with smooth acceleration
+  stepper.setMaxSpeed(min(speedInSteps, MAX_SPEED_STEPS));
+  stepper.moveTo(targetSteps);
+  
+  // Configure movement with smooth acceleration
+  stepper.setMaxSpeed(min(speedInSteps, MAX_SPEED_STEPS));
+  stepper.moveTo(targetSteps);
+  
+  digitalWrite(ENABLE_PIN, LOW); // Enable motor
+  isMoving = true;
+  
+  Serial.println("Movement started:");
+  Serial.printf("Target: %.1fmm (%ld steps), Speed: %d%% (%.1fmm/s)\n", 
+                targetPos, targetSteps, speedPercent, actualSpeed);
+  
+  server.send(200, "text/plain", "Movement started!");
+}
+
+void handleStop() {
+  stepper.stop();
+  isMoving = false;
+  digitalWrite(ENABLE_PIN, HIGH); // Disable motor
+  Serial.println("Emergency stop activated");
+  server.send(200, "text/plain", "Movement stopped!");
+}
+
+void handleStatus() {
+  float currentPosInMM = stepper.currentPosition() / STEPS_PER_MM;
+  
+  String json = "{";
+  json += "\"homed\":" + String(isHomed ? "true" : "false") + ",";
+  json += "\"moving\":" + String(isMoving ? "true" : "false") + ",";
+  json += "\"position\":" + String(currentPosInMM, 2);
+  json += "}";
+  
+  server.send(200, "application/json", json);
+}
